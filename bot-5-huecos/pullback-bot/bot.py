@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Bot "5 huecos · RSI(2) pullback" para Trading 212 (cuenta Invest en EUR).
+Bot "8 huecos · RSI(2) pullback" para Trading 212 (cuenta Invest en EUR), ~80 acciones europeas.
 
 Se ejecuta cada 30 minutos durante la sesión europea (lo lanza GitHub Actions):
   - revisa las posiciones con el precio en tiempo real de Trading 212 y vende las que ya han rebotado
-  - entre las 16:40 y las 17:25 compra las acciones más sobrevendidas para llenar los huecos libres
+  - compra para llenar huecos libres: de 16:40 a 17:25 con RSI(2) < 30; antes, solo si hay desplomes (RSI(2) < 5)
   - cada hora te manda un resumen de la cartera al móvil
 
 Comandos:
@@ -27,47 +27,117 @@ import base64
 import datetime as dt
 import math
 import os
+import re
 import sys
 import time
+import unicodedata
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
-from strategy import Params, backtest_hourly, exit_reason, rank_entries, stats
+from strategy import (AFTERNOON_START, Params, backtest_hourly, daily_state, entry_candidates, exit_reason,
+                      stats, threshold_for)
 
 TZ = ZoneInfo("Europe/Madrid")
 P = Params()
 
+# (símbolo de Yahoo, palabras del nombre en Trading 212, nombre corto, ISIN si lo sé seguro)
 UNIVERSE = [
-    ("SAP.DE", "DE0007164600", "SAP"),
-    ("SIE.DE", "DE0007236101", "Siemens"),
-    ("ALV.DE", "DE0008404005", "Allianz"),
-    ("DTE.DE", "DE0005557508", "Deutsche Telekom"),
-    ("MUV2.DE", "DE0008430026", "Munich Re"),
-    ("ASML.AS", "NL0010273215", "ASML"),
-    ("AD.AS", "NL0011794037", "Ahold Delhaize"),
-    ("MC.PA", "FR0000121014", "LVMH"),
-    ("OR.PA", "FR0000120321", "L'Oréal"),
-    ("RMS.PA", "FR0000052292", "Hermès"),
-    ("TTE.PA", "FR0000120271", "TotalEnergies"),
-    ("SAN.PA", "FR0000120578", "Sanofi"),
-    ("AI.PA", "FR0000120073", "Air Liquide"),
-    ("SU.PA", "FR0000121972", "Schneider Electric"),
-    ("BNP.PA", "FR0000131104", "BNP Paribas"),
-    ("IBE.MC", "ES0144580Y14", "Iberdrola"),
-    ("ITX.MC", "ES0148396007", "Inditex"),
-    ("SAN.MC", "ES0113900J37", "Banco Santander"),
-    ("BBVA.MC", "ES0113211835", "BBVA"),
-    ("ENEL.MI", "IT0003128367", "Enel"),
-    ("ISP.MI", "IT0000072618", "Intesa Sanpaolo"),
-    ("UCG.MI", "IT0005239360", "UniCredit"),
+    # Alemania
+    ("SAP.DE", "SAP", "SAP", "DE0007164600"),
+    ("SIE.DE", "Siemens", "Siemens", "DE0007236101"),
+    ("ALV.DE", "Allianz", "Allianz", "DE0008404005"),
+    ("DTE.DE", "Telekom", "Deutsche Telekom", "DE0005557508"),
+    ("MUV2.DE", "Munich|Münchener|Muenchener", "Munich Re", "DE0008430026"),
+    ("BAS.DE", "BASF", "BASF", None),
+    ("BAYN.DE", "Bayer", "Bayer", None),
+    ("BMW.DE", "BMW|Bayerische Motoren", "BMW", None),
+    ("MBG.DE", "Mercedes", "Mercedes-Benz", None),
+    ("VOW3.DE", "Volkswagen", "Volkswagen", None),
+    ("ADS.DE", "adidas", "adidas", None),
+    ("DB1.DE", "Deutsche Börse|Deutsche Boerse", "Deutsche Börse", None),
+    ("IFX.DE", "Infineon", "Infineon", None),
+    ("DHL.DE", "DHL|Deutsche Post", "DHL", None),
+    ("RHM.DE", "Rheinmetall", "Rheinmetall", None),
+    ("ENR.DE", "Siemens Energy", "Siemens Energy", None),
+    ("DBK.DE", "Deutsche Bank", "Deutsche Bank", None),
+    ("EOAN.DE", "E.ON|EON", "E.ON", None),
+    ("HNR1.DE", "Hannover", "Hannover Re", None),
+    ("MTX.DE", "MTU", "MTU Aero", None),
+    ("CBK.DE", "Commerzbank", "Commerzbank", None),
+    # Francia
+    ("MC.PA", "LVMH", "LVMH", "FR0000121014"),
+    ("OR.PA", "L'Or|L’Or|Oreal", "L'Oréal", "FR0000120321"),
+    ("RMS.PA", "Herm", "Hermès", "FR0000052292"),
+    ("TTE.PA", "Total", "TotalEnergies", "FR0000120271"),
+    ("SAN.PA", "Sanofi", "Sanofi", "FR0000120578"),
+    ("AI.PA", "Air Liquide", "Air Liquide", "FR0000120073"),
+    ("SU.PA", "Schneider", "Schneider Electric", "FR0000121972"),
+    ("BNP.PA", "BNP", "BNP Paribas", "FR0000131104"),
+    ("CS.PA", "AXA", "AXA", None),
+    ("SAF.PA", "Safran", "Safran", None),
+    ("AIR.PA", "Airbus", "Airbus", None),
+    ("EL.PA", "Essilor", "EssilorLuxottica", None),
+    ("KER.PA", "Kering", "Kering", None),
+    ("DG.PA", "Vinci", "Vinci", None),
+    ("BN.PA", "Danone", "Danone", None),
+    ("RI.PA", "Pernod", "Pernod Ricard", None),
+    ("SGO.PA", "Gobain|Saint-Gobain", "Saint-Gobain", None),
+    ("GLE.PA", "Generale|Société Générale", "Société Générale", None),
+    ("ACA.PA", "Agricole", "Crédit Agricole", None),
+    ("CAP.PA", "Capgemini", "Capgemini", None),
+    ("ORA.PA", "Orange", "Orange", None),
+    ("ENGI.PA", "Engie", "Engie", None),
+    ("HO.PA", "Thales", "Thales", None),
+    ("LR.PA", "Legrand", "Legrand", None),
+    ("STMPA.PA", "STMicro", "STMicroelectronics", None),
+    # Países Bajos
+    ("ASML.AS", "ASML", "ASML", "NL0010273215"),
+    ("AD.AS", "Ahold|Koninklijke Ahold", "Ahold Delhaize", "NL0011794037"),
+    ("INGA.AS", "ING", "ING", None),
+    ("PRX.AS", "Prosus", "Prosus", None),
+    ("WKL.AS", "Wolters", "Wolters Kluwer", None),
+    ("HEIA.AS", "Heineken", "Heineken", None),
+    ("ADYEN.AS", "Adyen", "Adyen", None),
+    ("PHIA.AS", "Philips|Koninklijke Philips", "Philips", None),
+    ("ASM.AS", "ASM International", "ASM International", None),
+    ("ABN.AS", "ABN", "ABN AMRO", None),
+    # España
+    ("IBE.MC", "Iberdrola", "Iberdrola", "ES0144580Y14"),
+    ("ITX.MC", "Inditex|Industria de Dise", "Inditex", "ES0148396007"),
+    ("SAN.MC", "Santander", "Banco Santander", "ES0113900J37"),
+    ("BBVA.MC", "BBVA|Bilbao", "BBVA", "ES0113211835"),
+    ("CABK.MC", "CaixaBank", "CaixaBank", None),
+    ("TEF.MC", "Telef", "Telefónica", None),
+    ("REP.MC", "Repsol", "Repsol", None),
+    ("AMS.MC", "Amadeus", "Amadeus", None),
+    ("ACS.MC", "ACS|Actividades de Constr", "ACS", None),
+    ("AENA.MC", "Aena", "Aena", None),
+    ("SAB.MC", "Sabadell|Banco de Sabadell", "Banco Sabadell", None),
+    ("CLNX.MC", "Cellnex", "Cellnex", None),
+    # Italia
+    ("ENEL.MI", "Enel", "Enel", "IT0003128367"),
+    ("ISP.MI", "Intesa", "Intesa Sanpaolo", "IT0000072618"),
+    ("UCG.MI", "UniCredit", "UniCredit", "IT0005239360"),
+    ("ENI.MI", "Eni", "Eni", None),
+    ("STLAM.MI", "Stellantis", "Stellantis", None),
+    ("RACE.MI", "Ferrari", "Ferrari", None),
+    ("G.MI", "Generali|Assicurazioni", "Generali", None),
+    ("PRY.MI", "Prysmian", "Prysmian", None),
+    ("MB.MI", "Mediobanca", "Mediobanca", None),
+    ("LDO.MI", "Leonardo", "Leonardo", None),
+    # Bélgica y Finlandia
+    ("ABI.BR", "Anheuser|AB InBev", "AB InBev", None),
+    ("KBC.BR", "KBC", "KBC", None),
+    ("NDA-FI.HE", "Nordea", "Nordea", None),
+    ("NOKIA.HE", "Nokia", "Nokia", None),
 ]
-NAMES = {y: n for y, _, n in UNIVERSE}
+NAMES = {u[0]: u[2] for u in UNIVERSE}
 
 SESSION_START = dt.time(9, 5)
 SESSION_END = dt.time(17, 25)
-ENTRY_START = dt.time(16, 40)
+FIRST_BUY = dt.time(9, 35)   # no comprar en los primeros minutos (precios de apertura muy movidos)
 MIN_ORDER_EUR = 1.0
 
 
@@ -132,8 +202,11 @@ class T212:
     def instruments(self):
         return self._req("GET", "/equity/metadata/instruments")
 
-    def history(self, ticker: str, limit: int = 10):
-        return self._req("GET", "/equity/history/orders", params={"ticker": ticker, "limit": limit})
+    def history(self, ticker: str | None = None, limit: int = 50):
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        return self._req("GET", "/equity/history/orders", params=params)
 
     def market_order(self, ticker: str, quantity: float):
         # La API no es idempotente: nunca se reintenta a ciegas tras un timeout.
@@ -148,16 +221,44 @@ def client_from_env() -> T212:
     return T212(key, secret, os.getenv("T212_ENV", "live"))
 
 
+def _norm(x: str) -> str:
+    x = unicodedata.normalize("NFKD", x or "")
+    return "".join(ch for ch in x if not unicodedata.combining(ch)).lower().replace("’", "'")
+
+
+def _base(ticker: str) -> str:
+    """'SAPd_EQ' -> 'SAP', 'MUV2d_EQ' -> 'MUV2' (quita el sufijo de bolsa en minúsculas)."""
+    t = ticker.split("_")[0]
+    return re.sub(r"[a-z]+$", "", t)
+
+
 def resolve_tickers(instruments: list[dict]) -> dict[str, str]:
-    """Símbolo de Yahoo -> ticker de Trading 212 (por ISIN, solo cotizaciones en EUR)."""
+    """Símbolo de Yahoo -> ticker de Trading 212. Solo acciones en EUR. Primero por ISIN; si no,
+    por nombre + símbolo. Si hay dudas, la acción se descarta (mejor no operarla que operar otra)."""
+    eur = [i for i in instruments if i.get("currencyCode") == "EUR" and i.get("type") == "STOCK"]
     by_isin: dict[str, list[dict]] = {}
-    for ins in instruments:
-        if ins.get("currencyCode") == "EUR" and ins.get("type") == "STOCK":
-            by_isin.setdefault(ins.get("isin"), []).append(ins)
+    for ins in eur:
+        by_isin.setdefault(ins.get("isin"), []).append(ins)
     out = {}
-    for ysym, isin, _ in UNIVERSE:
-        cands = sorted(by_isin.get(isin, []), key=lambda i: i.get("addedOn") or "")
+    for ysym, kw, _, isin in UNIVERSE:
+        cands = by_isin.get(isin, []) if isin else []
+        if not cands:
+            ybase = re.sub(r"[^A-Z0-9]", "", ysym.split(".")[0].upper())
+            pats = [(len(k), re.compile(r"(^|[^a-z0-9])" + re.escape(_norm(k)))) for k in kw.split("|")]
+            hits = []
+            for i in eur:
+                lens = [n for n, p in pats if p.search(_norm(i.get("name", "")))]
+                if lens:
+                    same = re.sub(r"[^A-Z0-9]", "", _base(i["ticker"]).upper()) == ybase
+                    hits.append((i, same, max(lens)))
+            same = [i for i, ok, _ in hits if ok]
+            # con varias coincidencias manda el símbolo; con una sola, vale si el nombre es distintivo
+            if same:
+                cands = same
+            elif len(hits) == 1 and hits[0][2] >= 5:
+                cands = [hits[0][0]]
         if cands:
+            cands.sort(key=lambda i: i.get("addedOn") or "")
             out[ysym] = cands[0]["ticker"]
     return out
 
@@ -210,10 +311,9 @@ def place_with_precision(api: T212, ticker: str, qty: float, sell: bool):
     raise last or RuntimeError("cantidad demasiado pequeña")
 
 
-def wait_fill(api: T212, ticker: str, order_id: int, seconds: int = 45) -> dict | None:
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        time.sleep(10)
+def wait_fill(api: T212, ticker: str, order_id: int, tries: int = 3) -> dict | None:
+    for _ in range(tries):
+        time.sleep(12)
         try:
             for it in api.history(ticker, limit=5).get("items", []):
                 if it.get("order", {}).get("id") == order_id and it.get("fill"):
@@ -226,12 +326,17 @@ def wait_fill(api: T212, ticker: str, order_id: int, seconds: int = 45) -> dict 
 def bot_positions(api: T212, tickers: dict[str, str]) -> list[dict]:
     """Posiciones que abrió ESTE bot (última compra hecha vía API). Lo tuyo a mano no se toca."""
     rev = {t: y for y, t in tickers.items()}
+    mine = [p for p in api.positions()
+            if p["instrument"]["ticker"] in rev and p.get("quantityAvailableForTrading", 0) > 0]
+    if not mine:
+        return []
+    recent = api.history(limit=50).get("items", [])  # una sola llamada para todas
     out = []
-    for pos in api.positions():
+    for pos in mine:
         t = pos["instrument"]["ticker"]
-        if t not in rev or pos.get("quantityAvailableForTrading", 0) <= 0:
-            continue
-        hist = api.history(t, limit=10).get("items", [])
+        hist = [h for h in recent if h["order"].get("ticker") == t]
+        if not hist:
+            hist = api.history(t, limit=10).get("items", [])
         buys = [h for h in hist if h["order"].get("side") == "BUY" and h["order"].get("status") == "FILLED"]
         if not buys or buys[0]["order"].get("initiatedFrom") != "API":
             log(f"Ignoro {t}: no la compró el bot")
@@ -257,31 +362,34 @@ def cmd_run(force: bool = False):
     if not force and not in_session(now):
         log(f"Fuera de horario de bolsa ({now:%a %H:%M}).")
         return
-    entry_window = force or now.time() >= ENTRY_START
+    afternoon = now.time() >= AFTERNOON_START
     dry = os.getenv("DRY_RUN") == "1"
     api = client_from_env()
     tag = ("" if api.env == "live" else " [DEMO]") + (" [SIMULACIÓN]" if dry else "")
 
     tickers = resolve_tickers(api.instruments())
-    syms = [y for y, _, _ in UNIVERSE if y in tickers]
+    syms = [u[0] for u in UNIVERSE if u[0] in tickers]
     daily = fetch_daily(syms)
+    syms = [x for x in syms if x in daily.columns]
+    daily = daily[syms]
     today = pd.Timestamp(now.date())
-    fresh = [s for s in syms if s in daily.columns and daily[s].last_valid_index() == today]
-    if len(fresh) < len(syms) / 2 and not force:
-        log("Hoy no hay sesión (festivo).")
-        return
-    prior = daily[daily.index < today]
-    live_px = {s: float(daily.loc[today, s]) for s in fresh}
+    if today not in daily.index or daily.loc[today].notna().sum() < len(syms) / 2:
+        if not force:
+            log("Hoy no hay sesión (festivo).")
+            return
+        daily.loc[today] = daily.ffill().iloc[-1]
+    state = {k: v.loc[today].values for k, v in daily_state(daily, P).items()}
+    col = {x: i for i, x in enumerate(syms)}
+    live_px = daily.loc[today].values.astype(float)   # Yahoo, ~15 min de retraso
 
-    # 1) Ventas (precio en tiempo real de Trading 212)
+    # 1) Ventas, con el precio en tiempo real de Trading 212
     held = bot_positions(api, tickers)
     remaining = []
     for pos in held:
         s = pos["ysym"]
         px = float(pos["currentPrice"])
         days = int((daily.index > pos["entry_date"]).sum())
-        reason = exit_reason(prior[s].values, px, float(pos["averagePricePaid"]), days,
-                             entry_window and now.time() >= ENTRY_START, P)
+        reason = exit_reason(state["sum_exit"][col[s]], px, float(pos["averagePricePaid"]), days, afternoon, P)
         if not reason:
             remaining.append(pos)
             continue
@@ -304,34 +412,35 @@ def cmd_run(force: bool = False):
         else:
             notify(f"Venta enviada: {NAMES[s]}{tag}", f"{q} acc. · {reason} (pendiente de confirmar)", "hourglass", 4)
 
-    # 2) Compras (solo en la ventana de la tarde)
-    if entry_window and len(remaining) < P.slots:
-        summ = api.summary()
-        cash = float(summ["cash"]["availableToTrade"])
-        slot_eur = float(summ["totalValue"]) / P.slots
-        exclude = {h["ysym"] for h in remaining}
-        cands = rank_entries(daily, today, live_px, exclude, P)
-        free = P.slots - len(remaining)
-        for r, s in cands[:free]:
-            amount = min(slot_eur, cash * 0.98)
-            if amount < MIN_ORDER_EUR:
-                break
-            px = live_px[s]
-            if dry:
-                notify(f"COMPRARÍA {NAMES[s]}{tag}", f"≈{amount:.2f} € a ~{px:.2f} € · RSI2 {r:.0f}", "shopping_cart")
-                cash -= amount
-                continue
-            try:
-                order, q = place_with_precision(api, tickers[s], amount / px, sell=False)
-            except Exception as e:
-                notify(f"⚠️ No pude comprar {NAMES[s]}", str(e)[:250], "warning", 3)
-                continue
-            fill = wait_fill(api, tickers[s], order["id"])
-            fpx = fill["fill"]["price"] if fill else px
-            cash -= q * fpx
-            notify(f"COMPRADA {NAMES[s]}{tag}",
-                   f"{q} acc. a {fpx:.2f} € (≈{q * fpx:.2f} €) · RSI2 {r:.0f} · venderá al rebotar",
-                   "shopping_cart", 4)
+    # 2) Compras: por la tarde con RSI(2) < 30; el resto del día solo desplomes (RSI(2) < 5)
+    if (force or now.time() >= FIRST_BUY) and len(remaining) < P.slots:
+        thr = threshold_for(now.time(), P)
+        held_syms = {h["ysym"] for h in remaining}
+        cands = [(r, syms[k]) for r, k in entry_candidates(state, live_px, thr, P) if syms[k] not in held_syms]
+        if cands:
+            summ = api.summary()
+            cash = float(summ["cash"]["availableToTrade"])
+            slot_eur = float(summ["totalValue"]) / P.slots
+            for r, s in cands[:P.slots - len(remaining)]:
+                amount = min(slot_eur, cash * 0.98)
+                if amount < MIN_ORDER_EUR:
+                    break
+                px = float(live_px[col[s]])
+                if dry:
+                    notify(f"COMPRARÍA {NAMES[s]}{tag}", f"≈{amount:.2f} € a ~{px:.2f} € · RSI2 {r:.0f}", "shopping_cart")
+                    cash -= amount
+                    continue
+                try:
+                    order, q = place_with_precision(api, tickers[s], amount / px, sell=False)
+                except Exception as e:
+                    notify(f"⚠️ No pude comprar {NAMES[s]}", str(e)[:250], "warning", 3)
+                    continue
+                fill = wait_fill(api, tickers[s], order["id"])
+                fpx = fill["fill"]["price"] if fill else px
+                cash -= q * fpx
+                notify(f"COMPRADA {NAMES[s]}{tag}",
+                       f"{q} acc. a {fpx:.2f} € (≈{q * fpx:.2f} €) · RSI2 {r:.0f} · venderá al rebotar",
+                       "shopping_cart", 4)
 
     # 3) Resumen horario
     if os.getenv("NOTIFY_PULSE", "1") == "1" and (now.minute < 30 or force):
@@ -353,7 +462,7 @@ def send_pulse(api: T212, tickers: dict[str, str], tag: str = ""):
 # --------------------------------------------------------------------------- otros comandos
 
 def cmd_backtest():
-    syms = [y for y, _, _ in UNIVERSE]
+    syms = [u[0] for u in UNIVERSE]
     hourly = fetch_hourly(syms)
     lines = [f"# Backtest · {len(hourly.columns)} acciones · barras de 1 h", ""]
     for cost in (0.0005, 0.001):
@@ -372,16 +481,21 @@ def cmd_backtest():
             f.write(text + "\n")
     st = stats(eq, tr, bench)
     notify("Backtest terminado",
-           f"10 € → {st['10€ se convierten en']} € (comprar y mantener: {st['comprar y mantener el universo']} €) · "
+           f"10 € → {st['10€ se convierten en']} € (comprar y mantener: {st['comprar y mantener todo el universo']} €) · "
            f"{st['operaciones']} operaciones, {st['acierto %']} % ganadoras", "bar_chart")
 
 
 def cmd_resolve():
     api = client_from_env()
-    tickers = resolve_tickers(api.instruments())
-    for y, isin, n in UNIVERSE:
-        print(f"{n:22s} {y:9s} {isin}  ->  {tickers.get(y, 'NO ENCONTRADA')}")
-    notify("Universo comprobado", f"{len(tickers)}/{len(UNIVERSE)} acciones encontradas en Trading 212", "white_check_mark")
+    ins = api.instruments()
+    tickers = resolve_tickers(ins)
+    names = {i["ticker"]: i.get("name", "") for i in ins}
+    for y, _, n, _ in UNIVERSE:
+        t = tickers.get(y)
+        print(f"{n:22s} {y:10s} ->  {t + '  (' + names.get(t, '') + ')' if t else 'NO ENCONTRADA'}")
+    missing = [NAMES[u[0]] for u in UNIVERSE if u[0] not in tickers]
+    notify("Universo comprobado", f"{len(tickers)}/{len(UNIVERSE)} acciones encontradas en Trading 212"
+           + (f". Faltan: {', '.join(missing)}" if missing else ""), "white_check_mark")
 
 
 def cmd_status():

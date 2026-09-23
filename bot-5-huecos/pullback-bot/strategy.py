@@ -1,18 +1,20 @@
 """
-Estrategia "5 huecos · RSI(2) pullback con salidas intradía".
+Estrategia "8 huecos · RSI(2) pullback" sobre ~80 grandes europeas en EUR.
 
-- Universo: 22 grandes de la zona euro (en EUR -> sin comisión de cambio en Trading 212).
-- El saldo se divide en 5 huecos (con 10 € -> 2 € por operación).
-- COMPRA (a partir de las 16:40): acciones por encima de su media de 200 sesiones cuyo RSI(2),
-  calculado con el precio de ese momento, está por debajo de 30. Primero las más sobrevendidas.
-- VENDE en cualquier momento de la sesión (se revisa cada 30 min con el precio en tiempo real
-  de Trading 212) en cuanto el precio supera su media de 5 sesiones. También con -10 % (stop) o
-  a los 10 días.
+- El saldo se divide en 8 huecos (con 10 € -> 1,25 € por operación).
+- COMPRA acciones por encima de su media de 200 sesiones que han caído fuerte a corto plazo
+  (RSI de 2 días, calculado con el precio de ese momento):
+    · de 16:40 a 17:25  -> RSI(2) < 30   (la señal principal)
+    · durante el día    -> RSI(2) < 5    (solo desplomes muy fuertes)
+  Primero las más castigadas.
+- VENDE en cualquier momento (se revisa cada 30 min con el precio en tiempo real de Trading 212)
+  en cuanto el precio supera su media de 5 sesiones. También con -10 % o a los 10 días.
 
-El mismo código se usa en el backtest (barras de 1 hora) y en vivo.
+El mismo cálculo se usa en el backtest (barras de 1 hora) y en vivo.
 """
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 
 import numpy as np
@@ -21,15 +23,25 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class Params:
-    slots: int = 5
+    slots: int = 8
     rsi_len: int = 2
-    rsi_entry: float = 30.0
+    rsi_entry: float = 30.0          # franja de la tarde
+    rsi_entry_intraday: float = 5.0  # resto del día
     trend_len: int = 200
     exit_len: int = 5
     stop_loss: float = 0.10
     max_hold_days: int = 10
-    cost_per_side: float = 0.0005   # spread + deslizamiento estimado por operación
+    cost_per_side: float = 0.0005    # spread + deslizamiento estimado por operación
 
+
+AFTERNOON_START = dt.time(16, 40)
+
+
+def threshold_for(t: dt.time, p: Params) -> float:
+    return p.rsi_entry if t >= AFTERNOON_START else p.rsi_entry_intraday
+
+
+# --------------------------------------------------------------------------- indicadores
 
 def rsi(close: pd.Series, n: int) -> pd.Series:
     """RSI de Wilder."""
@@ -43,116 +55,107 @@ def rsi(close: pd.Series, n: int) -> pd.Series:
     return out.where(avg_down != 0.0, 100.0)
 
 
-def rsi_last(values: np.ndarray, n: int) -> float:
-    return float(rsi(pd.Series(values, dtype=float).ffill(), n).iloc[-1])
+def daily_state(daily: pd.DataFrame, p: Params) -> dict[str, pd.DataFrame]:
+    """Estado de cada acción al empezar cada día (todo con cierres ANTERIORES a ese día).
+    Con esto el RSI(2) y las medias se actualizan al instante con el precio de ese momento."""
+    n = p.rsi_len
+    delta = daily.diff()
+    au = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    ad = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    return {
+        "au": au.shift(1), "ad": ad.shift(1), "prev": daily.shift(1),
+        "sum_trend": daily.rolling(p.trend_len - 1, min_periods=p.trend_len - 1).sum().shift(1),
+        "sum_exit": daily.rolling(p.exit_len - 1, min_periods=p.exit_len - 1).sum().shift(1),
+    }
 
 
-def entry_signal(prior_closes: np.ndarray, price: float, p: Params) -> float | None:
-    """prior_closes: cierres diarios ANTERIORES a hoy (al menos trend_len). price: precio actual.
-    Devuelve el RSI(2) si hay señal de compra, si no None."""
-    x = np.append(np.asarray(prior_closes, dtype=float)[-(p.trend_len + 20):], price)
-    if len(x) < p.trend_len + 1 or np.isnan(price) or np.isnan(x[-4:]).any():
-        return None
-    if np.isnan(x).sum() > 20:
-        return None
-    trend = np.nanmean(x[-p.trend_len:])
-    r = rsi_last(x, p.rsi_len)
-    if price > trend and r < p.rsi_entry:
-        return r
-    return None
+def live_rsi(au, ad, prev, price, n: int):
+    a = 1.0 / n
+    delta = price - prev
+    au2 = (1 - a) * au + a * np.clip(delta, 0, None)
+    ad2 = (1 - a) * ad + a * np.clip(-delta, 0, None)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(ad2 == 0, 100.0, 100.0 - 100.0 / (1.0 + au2 / ad2))
 
 
-def exit_reason(prior_closes: np.ndarray, price: float, entry_price: float, days_held: int,
-                is_entry_window: bool, p: Params) -> str | None:
-    """Motivo de venta o None. days_held = sesiones completas desde la compra (0 = hoy)."""
-    if np.isnan(price):
+def entry_candidates(state_row: dict[str, np.ndarray], price: np.ndarray, threshold: float, p: Params):
+    """Índices de columnas con señal de compra, ordenados de más a menos sobrevendida."""
+    r = live_rsi(state_row["au"], state_row["ad"], state_row["prev"], price, p.rsi_len)
+    sma = (state_row["sum_trend"] + price) / p.trend_len
+    with np.errstate(invalid="ignore"):
+        ok = (price > sma) & (r < threshold) & ~np.isnan(price) & ~np.isnan(sma) & ~np.isnan(r)
+    idx = np.where(ok)[0]
+    return sorted(((float(r[k]), int(k)) for k in idx))
+
+
+def exit_reason(sum_exit_prior: float, price: float, entry_price: float, days_held: int,
+                is_afternoon: bool, p: Params) -> str | None:
+    """Motivo de venta o None. sum_exit_prior = suma de los últimos (exit_len-1) cierres anteriores.
+    days_held = sesiones desde la compra (0 = hoy)."""
+    if price is None or np.isnan(price):
         return None
     if price <= entry_price * (1.0 - p.stop_loss):
         return f"stop -{p.stop_loss:.0%}"
     if days_held == 0:
         return None  # nunca vender el mismo día de la compra
-    last = np.asarray(prior_closes, dtype=float)[-(p.exit_len - 1):]
-    sma = (np.nansum(last) + price) / (np.count_nonzero(~np.isnan(last)) + 1)
-    if price > sma:
+    if not np.isnan(sum_exit_prior) and price > (sum_exit_prior + price) / p.exit_len:
         return f"rebote (> media {p.exit_len} días)"
-    if days_held >= p.max_hold_days and is_entry_window:
+    if days_held >= p.max_hold_days and is_afternoon:
         return f"tiempo ({days_held} sesiones)"
     return None
 
 
-def rank_entries(daily: pd.DataFrame, today, prices: dict[str, float], exclude: set[str], p: Params):
-    """Lista [(rsi, símbolo)] de candidatos ordenados (más sobrevendido primero)."""
-    prior = daily[daily.index < pd.Timestamp(today)]
-    out = []
-    for s, px in prices.items():
-        if s in exclude or s not in prior.columns:
-            continue
-        r = entry_signal(prior[s].values, px, p)
-        if r is not None:
-            out.append((r, s))
-    out.sort()
-    return out
+# --------------------------------------------------------------------------- backtest (barras 1 h)
 
-
-# --------------------------------------------------------------------------- backtest (barras 1h)
-
-def backtest_hourly(hourly: pd.DataFrame, p: Params = Params(), entry_hour: int = 16):
-    """hourly: precios de cierre de barras de 1 h (índice en hora de Madrid, columnas = símbolos).
-    Compra con el cierre de la barra de las `entry_hour` (≈17:00), revisa ventas en cada barra."""
+def backtest_hourly(hourly: pd.DataFrame, p: Params = Params()):
+    """hourly: cierres de barras de 1 h (índice en hora de Madrid, columnas = acciones).
+    La barra que empieza a las 16:00 (cierra a las 17:00) cuenta como franja de la tarde."""
     hourly = hourly[hourly.index.hour.isin(range(9, 18))].dropna(how="all")
     D = pd.Index(hourly.index.date)
     daily = hourly.groupby(D).last()
     dates = list(daily.index)
     di = {d: i for i, d in enumerate(dates)}
-    dv = daily.values
-    cols = list(hourly.columns)
+    st = {k: v.values for k, v in daily_state(daily, p).items()}
     P = hourly.values
+    cols = list(hourly.columns)
     cash = [1.0 / p.slots] * p.slots
-    pos = [None] * p.slots          # (col, entry_price, entry_day_idx, qty)
+    pos = [None] * p.slots   # (col, entry_price, entry_day_idx, qty)
     trades, eqs = [], {}
-    for t_i, t in enumerate(hourly.index):
-        d = t.date()
-        i = di[d]
-        if i < p.trend_len + 2:
+    for ti, t in enumerate(hourly.index):
+        i = di[t.date()]
+        if i < p.trend_len + 5:
             continue
-        prior = dv[:i]
-        now = P[t_i]
-        entry_bar = t.hour == entry_hour
+        px = P[ti]
+        afternoon = t.hour == 16
         for s in range(p.slots):
             if pos[s] is None:
                 continue
-            k, ep, edi, q = pos[s]
-            reason = exit_reason(prior[:, k], now[k], ep, i - edi, entry_bar, p)
-            if reason:
-                px = now[k]
-                cash[s] = q * px * (1 - p.cost_per_side)
-                trades.append((dates[edi], d, cols[k], px * (1 - p.cost_per_side) / (ep * (1 + p.cost_per_side)) - 1,
-                               reason, i - edi))
+            k, ep, ei, q = pos[s]
+            why = exit_reason(st["sum_exit"][i, k], px[k], ep, i - ei, afternoon, p)
+            if why:
+                cash[s] = q * px[k] * (1 - p.cost_per_side)
+                trades.append((dates[ei], t, cols[k], px[k] * (1 - p.cost_per_side) / (ep * (1 + p.cost_per_side)) - 1,
+                               why, i - ei))
                 pos[s] = None
-        if entry_bar:
+        if t.hour <= 16 and any(x is None for x in pos):
+            thr = p.rsi_entry if afternoon else p.rsi_entry_intraday
+            row = {k: v[i] for k, v in st.items()}
             held = {x[0] for x in pos if x}
-            cands = []
-            for k in range(len(cols)):
-                if k in held:
-                    continue
-                r = entry_signal(prior[:, k], now[k], p)
-                if r is not None:
-                    cands.append((r, k))
-            cands.sort()
+            cands = [c for c in entry_candidates(row, px, thr, p) if c[1] not in held]
             for s in range(p.slots):
                 if pos[s] is None and cands:
                     _, k = cands.pop(0)
-                    ep = now[k]
-                    pos[s] = (k, ep, i, cash[s] / (ep * (1 + p.cost_per_side)))
+                    pos[s] = (k, px[k], i, cash[s] / (px[k] * (1 + p.cost_per_side)))
                     cash[s] = 0.0
         if t.hour == 17:
-            eqs[d] = sum(cash) + sum(x[3] * (now[x[0]] if not np.isnan(now[x[0]]) else x[1]) for x in pos if x)
+            eqs[pd.Timestamp(t.date())] = sum(cash) + sum(
+                x[3] * (px[x[0]] if not np.isnan(px[x[0]]) else x[1]) for x in pos if x)
     eq = pd.Series(eqs, dtype=float)
-    eq.index = pd.to_datetime(eq.index)
     tr = pd.DataFrame(trades, columns=["entrada", "salida", "accion", "ret", "motivo", "dias"])
-    bench_daily = daily.loc[[x for x in daily.index if pd.Timestamp(x) in eq.index]]
-    bench = (bench_daily / bench_daily.iloc[0]).mean(axis=1)
-    bench.index = pd.to_datetime(bench.index)
+    b = daily.copy()
+    b.index = pd.to_datetime(b.index)
+    b = b.loc[eq.index]
+    bench = (1 + b.pct_change(fill_method=None).mean(axis=1).fillna(0)).cumprod()
     return eq, tr, bench
 
 
@@ -161,7 +164,7 @@ def stats(eq: pd.Series, tr: pd.DataFrame, bench: pd.Series) -> dict:
     return {
         "dias": len(eq),
         "10€ se convierten en": round(10 * eq.iloc[-1] / eq.iloc[0], 2),
-        "comprar y mantener el universo": round(10 * bench.iloc[-1] / bench.iloc[0], 2),
+        "comprar y mantener todo el universo": round(10 * bench.iloc[-1] / bench.iloc[0], 2),
         "caida maxima %": round(float((eq / eq.cummax() - 1).min() * 100), 1),
         "operaciones": len(tr),
         "operaciones por dia": round(len(tr) / max(len(eq), 1), 2),
