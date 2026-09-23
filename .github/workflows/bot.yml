@@ -1,0 +1,51 @@
+name: bot
+
+on:
+  schedule:
+    - cron: "*/30 7-16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Qué hacer"
+        type: choice
+        options: [run, backtest, resolve, status]
+        default: run
+      force:
+        description: "Ignorar el horario (solo para 'run')"
+        type: boolean
+        default: false
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bot-5-huecos/pullback-bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: bot-5-huecos/pullback-bot/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Ejecutar
+        env:
+          T212_API_KEY: ${{ secrets.T212_API_KEY }}
+          T212_API_SECRET: ${{ secrets.T212_API_SECRET }}
+          T212_ENV: ${{ vars.T212_ENV || 'live' }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DRY_RUN: ${{ vars.DRY_RUN || '0' }}
+          NOTIFY_PULSE: ${{ vars.NOTIFY_PULSE || '1' }}
+        run: |
+          CMD="${{ github.event.inputs.command || 'run' }}"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python bot.py "$CMD" --force
+          else
+            python bot.py "$CMD"
+          fi
